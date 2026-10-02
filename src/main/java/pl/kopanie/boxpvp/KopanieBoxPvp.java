@@ -3,7 +3,6 @@ package pl.kopanie.boxpvp;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
-import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.minecraft.block.Block;
@@ -16,6 +15,8 @@ import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.command.CommandSource;
 import net.minecraft.command.argument.IdentifierArgumentType;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
@@ -24,6 +25,8 @@ import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
 import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
 import net.minecraft.world.RaycastContext;
 import org.lwjgl.glfw.GLFW;
@@ -42,11 +45,21 @@ import java.util.Set;
  * /kop-start, /kop-stop    - wlacz / wylacz (to samo robi klawisz N)
  * /kop-lista, /kop-czysc   - podglad / czyszczenie slotow
  *
- * Kopie tak jak gracz trzymajacy lewy przycisk myszy: tylko bloki w zasiegu reki,
- * tylko widoczne (bez kopania przez sciany), z predkoscia zalezna od narzedzia.
- * Mod NIE porusza postacia ani nie obraca kamery - to Ty chodzisz po terenie.
+ * Mod sam: patrzy na blok (plynny obrot), podchodzi do generatorow w terenie,
+ * kopie jeden blok naraz jak lewy przycisk myszy i je wolowine gdy glod <= 4.
+ * Kilof trzymaj w aktywnym slocie, wolowine w hotbarze.
  */
 public class KopanieBoxPvp implements ClientModInitializer {
+
+    // ====== USTAWIENIA ======
+    private static final int EAT_AT_FOOD = 4;      // je gdy glod <= 4 (20 = pelny pasek)
+    private static final int EAT_UNTIL_FOOD = 18;  // przestaje jesc gdy glod >= 18
+    private static final float MAX_TURN = 25f;     // max obrot kamery na tick (stopnie)
+    private static final float ALIGN_DEG = 4f;     // kopie gdy patrzy dokladnie na blok
+    private static final int WALK_RANGE_H = 32;    // jak daleko szuka generatorow (poziomo)
+    private static final int WALK_RANGE_V = 8;     // jak daleko szuka generatorow (pionowo)
+    private static final int STUCK_TICKS = 100;    // po ilu tickach bez ruchu uznaje ze utknal
+    // ========================
 
     private static final int MAX_SLOTS = 10;
 
@@ -56,14 +69,23 @@ public class KopanieBoxPvp implements ClientModInitializer {
     private static BlockPos current = null;
     private static KeyBinding toggleKey;
 
+    private static BlockPos walkGoal = null;
+    private static Vec3d lastPos = null;
+    private static int stuckTicks = 0;
+    private static int tickCounter = 0;
+    private static boolean eating = false;
+    private static int prevSlot = -1;
+    private static boolean warnedNoFood = false;
+    private static boolean warnedEmpty = false;
+
     @Override
     public void onInitializeClient() {
         toggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "Kopanie: wlacz/wylacz", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_N, "Kopanie-boxpvp"));
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
-            dispatcher.register(ClientCommandManager.literal("post1").executes(ctx -> setPos(ctx.getSource(), true)));
-            dispatcher.register(ClientCommandManager.literal("post2").executes(ctx -> setPos(ctx.getSource(), false)));
+            dispatcher.register(ClientCommandManager.literal("post1").executes(ctx -> setPos(true)));
+            dispatcher.register(ClientCommandManager.literal("post2").executes(ctx -> setPos(false)));
 
             for (int i = 1; i <= MAX_SLOTS; i++) {
                 final int slot = i;
@@ -75,11 +97,11 @@ public class KopanieBoxPvp implements ClientModInitializer {
             }
 
             dispatcher.register(ClientCommandManager.literal("kop-start").executes(ctx -> { start(MinecraftClient.getInstance()); return 1; }));
-            dispatcher.register(ClientCommandManager.literal("kop-stop").executes(ctx -> { stop(MinecraftClient.getInstance()); return 1; }));
+            dispatcher.register(ClientCommandManager.literal("kop-stop").executes(ctx -> { stop(MinecraftClient.getInstance(), true); return 1; }));
             dispatcher.register(ClientCommandManager.literal("kop-lista").executes(ctx -> { list(); return 1; }));
             dispatcher.register(ClientCommandManager.literal("kop-czysc").executes(ctx -> {
                 for (int i = 0; i < MAX_SLOTS; i++) slots[i] = null;
-                stop(MinecraftClient.getInstance());
+                stop(MinecraftClient.getInstance(), false);
                 msg("Wyczyszczono sloty blokow.", Formatting.YELLOW);
                 return 1;
             }));
@@ -87,7 +109,7 @@ public class KopanieBoxPvp implements ClientModInitializer {
 
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (toggleKey.wasPressed()) {
-                if (active) stop(client); else start(client);
+                if (active) stop(client, true); else start(client);
             }
             if (active) tick(client);
         });
@@ -95,12 +117,13 @@ public class KopanieBoxPvp implements ClientModInitializer {
 
     // ------------------------------------------------------------ komendy
 
-    private static int setPos(FabricClientCommandSource src, boolean first) {
+    private static int setPos(boolean first) {
         ClientPlayerEntity p = MinecraftClient.getInstance().player;
         if (p == null) return 0;
         BlockPos pos = p.getBlockPos();
         if (first) pos1 = pos; else pos2 = pos;
         current = null;
+        walkGoal = null;
         msg("Pozycja " + (first ? "1" : "2") + ": " + fmt(pos), Formatting.GREEN);
         return 1;
     }
@@ -131,14 +154,27 @@ public class KopanieBoxPvp implements ClientModInitializer {
         }
         active = true;
         current = null;
+        walkGoal = null;
+        stuckTicks = 0;
+        lastPos = null;
+        eating = false;
+        warnedNoFood = false;
+        warnedEmpty = false;
         msg("Kopanie WLACZONE (N albo /kop-stop wylacza).", Formatting.GREEN);
     }
 
-    private static void stop(MinecraftClient mc) {
+    private static void stop(MinecraftClient mc, boolean announce) {
+        boolean wasActive = active;
         active = false;
         current = null;
-        if (mc != null && mc.interactionManager != null) mc.interactionManager.cancelBlockBreaking();
-        msg("Kopanie WYLACZONE.", Formatting.YELLOW);
+        walkGoal = null;
+        if (mc != null) {
+            releaseKeys(mc);
+            if (eating && mc.player != null && prevSlot >= 0) mc.player.getInventory().selectedSlot = prevSlot;
+            if (mc.interactionManager != null) mc.interactionManager.cancelBlockBreaking();
+        }
+        eating = false;
+        if (announce && wasActive) msg("Kopanie WYLACZONE.", Formatting.YELLOW);
     }
 
     private static void list() {
@@ -149,18 +185,23 @@ public class KopanieBoxPvp implements ClientModInitializer {
         msg("Kopanie: " + (active ? "wlaczone" : "wylaczone"), Formatting.AQUA);
     }
 
-    // ------------------------------------------------------------ kopanie
+    // ------------------------------------------------------------ glowna petla
 
     private static void tick(MinecraftClient mc) {
         ClientPlayerEntity p = mc.player;
         ClientWorld w = mc.world;
         ClientPlayerInteractionManager im = mc.interactionManager;
-        if (p == null || w == null || im == null) {
-            active = false;
-            current = null;
+        if (p == null || w == null || im == null || !p.isAlive()) {
+            stop(mc, false);
             return;
         }
-        if (mc.currentScreen != null) return; // pauza gdy otwarte menu/ekwipunek
+        if (mc.currentScreen != null) { // pauza gdy otwarte menu/ekwipunek
+            releaseKeys(mc);
+            return;
+        }
+        tickCounter++;
+
+        if (handleEating(mc, p, im)) return;
 
         Set<Block> targets = targets();
         double reach = Math.max(1.0, im.getReachDistance() - 0.5);
@@ -172,19 +213,145 @@ public class KopanieBoxPvp implements ClientModInitializer {
             }
             if (hit == null) current = null;
         }
-
         if (current == null) {
             im.cancelBlockBreaking();
             hit = pickNext(p, w, targets, reach);
-            if (hit == null) return; // nic w zasiegu - chodz po terenie
-            current = hit.getBlockPos();
+            if (hit != null) current = hit.getBlockPos();
         }
 
-        if (im.updateBlockBreakingProgress(current, hit.getSide())) {
-            mc.particleManager.addBlockBreakingParticles(current, hit.getSide());
-            p.swingHand(Hand.MAIN_HAND);
+        if (hit != null) {
+            // blok w zasiegu: stoimy, patrzymy na niego i kopiemy
+            mc.options.forwardKey.setPressed(false);
+            mc.options.jumpKey.setPressed(false);
+            stuckTicks = 0;
+            warnedEmpty = false;
+            float[] err = lookAt(p, hit.getPos());
+            if (Math.max(err[0], err[1]) <= ALIGN_DEG) {
+                if (im.updateBlockBreakingProgress(current, hit.getSide())) {
+                    mc.particleManager.addBlockBreakingParticles(current, hit.getSide());
+                    p.swingHand(Hand.MAIN_HAND);
+                }
+            }
+            return;
+        }
+
+        walk(mc, p, w, targets);
+    }
+
+    // ------------------------------------------------------------ chodzenie
+
+    private static void walk(MinecraftClient mc, ClientPlayerEntity p, ClientWorld w, Set<Block> targets) {
+        if (walkGoal == null || tickCounter % 10 == 0 || !isTarget(w, walkGoal, targets)) {
+            walkGoal = findWalkGoal(p, w, targets);
+        }
+        if (walkGoal == null) {
+            releaseKeys(mc);
+            if (!warnedEmpty) {
+                msg("Nie widze blokow do kopania w poblizu (podejdz do terenu).", Formatting.YELLOW);
+                warnedEmpty = true;
+            }
+            return;
+        }
+        warnedEmpty = false;
+
+        float[] err = lookAt(p, Vec3d.ofCenter(walkGoal));
+        mc.options.forwardKey.setPressed(err[0] < 25f);
+        mc.options.jumpKey.setPressed(p.horizontalCollision && p.isOnGround());
+
+        Vec3d now = p.getPos();
+        if (lastPos != null && now.squaredDistanceTo(lastPos) < 0.0004) stuckTicks++; else stuckTicks = 0;
+        lastPos = now;
+        if (stuckTicks > STUCK_TICKS) {
+            stop(mc, false);
+            msg("Utknalem - ustaw sie blizej generatora i wlacz ponownie (N).", Formatting.RED);
         }
     }
+
+    /** Najblizszy blok z listy w terenie, ktory ma odslonieta chociaz jedna strone. */
+    private static BlockPos findWalkGoal(ClientPlayerEntity p, ClientWorld w, Set<Block> targets) {
+        int minX = Math.min(pos1.getX(), pos2.getX()), maxX = Math.max(pos1.getX(), pos2.getX());
+        int minY = Math.min(pos1.getY(), pos2.getY()), maxY = Math.max(pos1.getY(), pos2.getY());
+        int minZ = Math.min(pos1.getZ(), pos2.getZ()), maxZ = Math.max(pos1.getZ(), pos2.getZ());
+        BlockPos pp = p.getBlockPos();
+        int x0 = Math.max(minX, pp.getX() - WALK_RANGE_H), x1 = Math.min(maxX, pp.getX() + WALK_RANGE_H);
+        int y0 = Math.max(minY, pp.getY() - WALK_RANGE_V), y1 = Math.min(maxY, pp.getY() + WALK_RANGE_V);
+        int z0 = Math.max(minZ, pp.getZ() - WALK_RANGE_H), z1 = Math.min(maxZ, pp.getZ() + WALK_RANGE_H);
+
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        BlockPos.Mutable m = new BlockPos.Mutable();
+        for (int x = x0; x <= x1; x++) {
+            for (int y = y0; y <= y1; y++) {
+                for (int z = z0; z <= z1; z++) {
+                    m.set(x, y, z);
+                    if (!isTarget(w, m, targets)) continue;
+                    double d = m.getSquaredDistance(p.getPos());
+                    if (d >= bestDist) continue;
+                    if (!isExposed(w, m)) continue;
+                    bestDist = d;
+                    best = m.toImmutable();
+                }
+            }
+        }
+        return best;
+    }
+
+    private static boolean isExposed(ClientWorld w, BlockPos pos) {
+        for (Direction d : Direction.values()) {
+            BlockPos n = pos.offset(d);
+            if (!w.getBlockState(n).isOpaqueFullCube(w, n)) return true;
+        }
+        return false;
+    }
+
+    // ------------------------------------------------------------ jedzenie
+
+    /** Zwraca true gdy aktualnie je (reszta logiki ma sie wtedy nie wykonywac). */
+    private static boolean handleEating(MinecraftClient mc, ClientPlayerEntity p, ClientPlayerInteractionManager im) {
+        int food = p.getHungerManager().getFoodLevel();
+        if (food > EAT_AT_FOOD) warnedNoFood = false;
+
+        if (!eating && food <= EAT_AT_FOOD) {
+            int s = findFoodSlot(p);
+            if (s >= 0) {
+                prevSlot = p.getInventory().selectedSlot;
+                p.getInventory().selectedSlot = s;
+                eating = true;
+                current = null;
+                im.cancelBlockBreaking();
+            } else if (!warnedNoFood) {
+                msg("Glod <= " + EAT_AT_FOOD + ", a nie mam wolowiny w hotbarze!", Formatting.RED);
+                warnedNoFood = true;
+            }
+        }
+
+        if (eating) {
+            mc.options.forwardKey.setPressed(false);
+            mc.options.jumpKey.setPressed(false);
+            ItemStack st = p.getInventory().getStack(p.getInventory().selectedSlot);
+            if (food >= EAT_UNTIL_FOOD || !isBeef(st)) {
+                eating = false;
+                mc.options.useKey.setPressed(false);
+                if (prevSlot >= 0) p.getInventory().selectedSlot = prevSlot;
+                return false;
+            }
+            mc.options.useKey.setPressed(true);
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean isBeef(ItemStack st) {
+        return st.isOf(Items.COOKED_BEEF) || st.isOf(Items.BEEF);
+    }
+
+    private static int findFoodSlot(ClientPlayerEntity p) {
+        for (int i = 0; i < 9; i++) if (p.getInventory().getStack(i).isOf(Items.COOKED_BEEF)) return i;
+        for (int i = 0; i < 9; i++) if (p.getInventory().getStack(i).isOf(Items.BEEF)) return i;
+        return -1;
+    }
+
+    // ------------------------------------------------------------ kopanie / celowanie
 
     private static BlockHitResult pickNext(ClientPlayerEntity p, ClientWorld w, Set<Block> targets, double reach) {
         int minX = Math.min(pos1.getX(), pos2.getX()), maxX = Math.max(pos1.getX(), pos2.getX());
@@ -219,7 +386,6 @@ public class KopanieBoxPvp implements ClientModInitializer {
         return null;
     }
 
-    /** Zwraca trafienie tylko jesli blok jest realnie widoczny (nie za innym blokiem) i w zasiegu. */
     private static BlockHitResult visibleHit(ClientPlayerEntity p, ClientWorld w, BlockPos pos, double reach) {
         Vec3d eye = p.getEyePos();
         Vec3d center = Vec3d.ofCenter(pos);
@@ -228,6 +394,25 @@ public class KopanieBoxPvp implements ClientModInitializer {
                 RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, p));
         if (r.getType() == HitResult.Type.BLOCK && r.getBlockPos().equals(pos)) return r;
         return null;
+    }
+
+    /** Plynnie obraca kamere w strone celu. Zwraca {blad_yaw, blad_pitch} po obrocie. */
+    private static float[] lookAt(ClientPlayerEntity p, Vec3d target) {
+        Vec3d eye = p.getEyePos();
+        double dx = target.x - eye.x, dy = target.y - eye.y, dz = target.z - eye.z;
+        double h = Math.sqrt(dx * dx + dz * dz);
+        float wantYaw = (float) (MathHelper.atan2(dz, dx) * 180.0 / Math.PI) - 90f;
+        float wantPitch = (float) -(MathHelper.atan2(dy, h) * 180.0 / Math.PI);
+
+        float dYaw = MathHelper.wrapDegrees(wantYaw - p.getYaw());
+        float dPitch = wantPitch - p.getPitch();
+        p.setYaw(p.getYaw() + MathHelper.clamp(dYaw, -MAX_TURN, MAX_TURN));
+        p.setPitch(MathHelper.clamp(p.getPitch() + MathHelper.clamp(dPitch, -MAX_TURN, MAX_TURN), -90f, 90f));
+
+        return new float[]{
+                Math.abs(MathHelper.wrapDegrees(wantYaw - p.getYaw())),
+                Math.abs(wantPitch - p.getPitch())
+        };
     }
 
     private static boolean isTarget(ClientWorld w, BlockPos pos, Set<Block> targets) {
@@ -248,6 +433,12 @@ public class KopanieBoxPvp implements ClientModInitializer {
     }
 
     // ------------------------------------------------------------ pomocnicze
+
+    private static void releaseKeys(MinecraftClient mc) {
+        mc.options.forwardKey.setPressed(false);
+        mc.options.jumpKey.setPressed(false);
+        mc.options.useKey.setPressed(false);
+    }
 
     private static String fmt(BlockPos p) {
         return p == null ? "brak" : p.getX() + ", " + p.getY() + ", " + p.getZ();
