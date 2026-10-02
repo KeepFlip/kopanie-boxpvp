@@ -3,12 +3,12 @@
   "id": "kopanie_boxpvp",
   "version": "${version}",
   "name": "Kopanie-boxpvp",
-  "description": "Automatyczne kopanie wybranych blokow w zaznaczonym terenie (/post1, /post2, /kop, /kop-start, /kop-stop).",
+  "description": "Klientowe auto-kopanie wybranych blokow w zaznaczonym terenie (klawisz N, /post1, /post2, /kop).",
   "authors": ["Ty"],
   "license": "MIT",
-  "environment": "*",
+  "environment": "client",
   "entrypoints": {
-    "main": ["pl.kopanie.boxpvp.KopanieBoxPvp"]
+    "client": ["pl.kopanie.boxpvp.KopanieBoxPvp"]
   },
   "depends": {
     "fabricloader": ">=0.15.0",
