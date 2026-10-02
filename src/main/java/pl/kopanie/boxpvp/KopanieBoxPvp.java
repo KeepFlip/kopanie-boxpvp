@@ -1,269 +1,262 @@
 package pl.kopanie.boxpvp;
 
-import com.mojang.brigadier.CommandDispatcher;
-import com.mojang.brigadier.context.CommandContext;
-import com.mojang.brigadier.exceptions.CommandSyntaxException;
-import net.fabricmc.api.ModInitializer;
-import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
-import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
-import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
-import net.minecraft.block.entity.BlockEntity;
+import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.network.ClientPlayerInteractionManager;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import net.minecraft.client.world.ClientWorld;
 import net.minecraft.command.CommandSource;
 import net.minecraft.command.argument.IdentifierArgumentType;
-import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
-import net.minecraft.registry.RegistryKey;
-import net.minecraft.server.command.ServerCommandSource;
-import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.server.world.ServerWorld;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
+import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
+import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.world.World;
+import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
+import org.lwjgl.glfw.GLFW;
 
-import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
-
-import static net.minecraft.server.command.CommandManager.argument;
-import static net.minecraft.server.command.CommandManager.literal;
 
 /**
- * Kopanie-boxpvp
+ * Kopanie-boxpvp (CLIENT) - Fabric 1.20.1
  *
- * /post1, /post2        - zaznacza rogi terenu (blok, na ktorym stoisz)
- * /kop <blok>           - slot 1 blokow do kopania
- * /kop2 ... /kop10 <blok> - kolejne sloty (do 10 roznych blokow)
- * /kop-start            - zaczyna automatyczne kopanie w terenie
- * /kop-stop             - konczy kopanie
- * /kop-lista            - pokazuje ustawienia
- * /kop-czysc            - czysci sloty blokow
+ * /post1, /post2           - rogi terenu (blok, na ktorym stoisz)
+ * /kop <blok>              - slot 1
+ * /kop2 ... /kop10 <blok>  - kolejne sloty (do 10 blokow)
+ * /kop-start, /kop-stop    - wlacz / wylacz (to samo robi klawisz N)
+ * /kop-lista, /kop-czysc   - podglad / czyszczenie slotow
+ *
+ * Kopie tak jak gracz trzymajacy lewy przycisk myszy: tylko bloki w zasiegu reki,
+ * tylko widoczne (bez kopania przez sciany), z predkoscia zalezna od narzedzia.
+ * Mod NIE porusza postacia ani nie obraca kamery - to Ty chodzisz po terenie.
  */
-public class KopanieBoxPvp implements ModInitializer {
+public class KopanieBoxPvp implements ClientModInitializer {
 
-    // ====== USTAWIENIA ======
-    /** Ile blokow max rozbijamy na 1 tick (20 ticków = 1 sekunda). */
-    private static final int BREAKS_PER_TICK = 8;
-    /** Ile blokow max sprawdzamy na tick (zeby nie lagowac przy duzym terenie). */
-    private static final int SCANS_PER_TICK = 4096;
-    /** Maksymalna objetosc terenu w blokach. */
-    private static final long MAX_VOLUME = 10_000_000L;
     private static final int MAX_SLOTS = 10;
-    // ========================
 
-    private static class PlayerData {
-        BlockPos pos1, pos2;
-        RegistryKey<World> world1, world2;
-        final Block[] slots = new Block[MAX_SLOTS];
-        boolean active = false;
-        long cursor = 0;
-    }
-
-    private static final Map<UUID, PlayerData> DATA = new HashMap<>();
-
-    private static PlayerData data(ServerPlayerEntity p) {
-        return DATA.computeIfAbsent(p.getUuid(), k -> new PlayerData());
-    }
+    private static BlockPos pos1, pos2;
+    private static final Block[] slots = new Block[MAX_SLOTS];
+    private static boolean active = false;
+    private static BlockPos current = null;
+    private static KeyBinding toggleKey;
 
     @Override
-    public void onInitialize() {
-        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> registerCommands(dispatcher));
+    public void onInitializeClient() {
+        toggleKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "Kopanie: wlacz/wylacz", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_N, "Kopanie-boxpvp"));
 
-        ServerTickEvents.END_SERVER_TICK.register(server -> {
-            for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-                PlayerData d = DATA.get(player.getUuid());
-                if (d != null && d.active) {
-                    tickDigging(player, d);
-                }
+        ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> {
+            dispatcher.register(ClientCommandManager.literal("post1").executes(ctx -> setPos(ctx.getSource(), true)));
+            dispatcher.register(ClientCommandManager.literal("post2").executes(ctx -> setPos(ctx.getSource(), false)));
+
+            for (int i = 1; i <= MAX_SLOTS; i++) {
+                final int slot = i;
+                String name = (i == 1) ? "kop" : "kop" + i;
+                dispatcher.register(ClientCommandManager.literal(name)
+                        .then(ClientCommandManager.argument("blok", IdentifierArgumentType.identifier())
+                                .suggests((ctx, builder) -> CommandSource.suggestIdentifiers(Registries.BLOCK.getIds(), builder))
+                                .executes(ctx -> setBlock(slot, ctx.getArgument("blok", Identifier.class)))));
             }
+
+            dispatcher.register(ClientCommandManager.literal("kop-start").executes(ctx -> { start(MinecraftClient.getInstance()); return 1; }));
+            dispatcher.register(ClientCommandManager.literal("kop-stop").executes(ctx -> { stop(MinecraftClient.getInstance()); return 1; }));
+            dispatcher.register(ClientCommandManager.literal("kop-lista").executes(ctx -> { list(); return 1; }));
+            dispatcher.register(ClientCommandManager.literal("kop-czysc").executes(ctx -> {
+                for (int i = 0; i < MAX_SLOTS; i++) slots[i] = null;
+                stop(MinecraftClient.getInstance());
+                msg("Wyczyszczono sloty blokow.", Formatting.YELLOW);
+                return 1;
+            }));
         });
 
-        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> DATA.remove(handler.getPlayer().getUuid()));
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            while (toggleKey.wasPressed()) {
+                if (active) stop(client); else start(client);
+            }
+            if (active) tick(client);
+        });
     }
 
-    // ---------------------------------------------------------------- komendy
+    // ------------------------------------------------------------ komendy
 
-    private void registerCommands(CommandDispatcher<ServerCommandSource> dispatcher) {
-        dispatcher.register(literal("post1").executes(ctx -> setPos(ctx, true)));
-        dispatcher.register(literal("post2").executes(ctx -> setPos(ctx, false)));
-
-        for (int i = 1; i <= MAX_SLOTS; i++) {
-            final int slot = i;
-            String name = (i == 1) ? "kop" : "kop" + i;
-            dispatcher.register(literal(name)
-                    .then(argument("blok", IdentifierArgumentType.identifier())
-                            .suggests((ctx, builder) -> CommandSource.suggestIdentifiers(Registries.BLOCK.getIds(), builder))
-                            .executes(ctx -> setBlock(ctx, slot))));
-        }
-
-        dispatcher.register(literal("kop-start").executes(this::start));
-        dispatcher.register(literal("kop-stop").executes(this::stop));
-        dispatcher.register(literal("kop-lista").executes(this::list));
-        dispatcher.register(literal("kop-czysc").executes(this::clear));
-    }
-
-    private int setPos(CommandContext<ServerCommandSource> ctx, boolean first) throws CommandSyntaxException {
-        ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
-        PlayerData d = data(player);
-        BlockPos pos = player.getBlockPos();
-        RegistryKey<World> w = player.getWorld().getRegistryKey();
-        if (first) {
-            d.pos1 = pos;
-            d.world1 = w;
-        } else {
-            d.pos2 = pos;
-            d.world2 = w;
-        }
-        d.cursor = 0;
-        msg(player, "Ustawiono pozycje " + (first ? "1" : "2") + ": " + pos.getX() + ", " + pos.getY() + ", " + pos.getZ(), Formatting.GREEN);
+    private static int setPos(FabricClientCommandSource src, boolean first) {
+        ClientPlayerEntity p = MinecraftClient.getInstance().player;
+        if (p == null) return 0;
+        BlockPos pos = p.getBlockPos();
+        if (first) pos1 = pos; else pos2 = pos;
+        current = null;
+        msg("Pozycja " + (first ? "1" : "2") + ": " + fmt(pos), Formatting.GREEN);
         return 1;
     }
 
-    private int setBlock(CommandContext<ServerCommandSource> ctx, int slot) throws CommandSyntaxException {
-        ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
-        Identifier id = IdentifierArgumentType.getIdentifier(ctx, "blok");
+    private static int setBlock(int slot, Identifier id) {
         if (!Registries.BLOCK.containsId(id)) {
-            msg(player, "Nie ma takiego bloku: " + id, Formatting.RED);
+            msg("Nie ma takiego bloku: " + id, Formatting.RED);
             return 0;
         }
-        Block block = Registries.BLOCK.get(id);
-        if (block.getDefaultState().isAir()) {
-            msg(player, "Nie mozna kopac powietrza.", Formatting.RED);
+        Block b = Registries.BLOCK.get(id);
+        if (b.getDefaultState().isAir()) {
+            msg("Nie mozna kopac powietrza.", Formatting.RED);
             return 0;
         }
-        data(player).slots[slot - 1] = block;
-        msg(player, "Slot " + slot + " = " + id, Formatting.GREEN);
+        slots[slot - 1] = b;
+        msg("Slot " + slot + " = " + id, Formatting.GREEN);
         return 1;
     }
 
-    private int start(CommandContext<ServerCommandSource> ctx) throws CommandSyntaxException {
-        ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
-        PlayerData d = data(player);
-
-        if (d.pos1 == null || d.pos2 == null) {
-            msg(player, "Najpierw ustaw teren: /post1 i /post2", Formatting.RED);
-            return 0;
+    private static void start(MinecraftClient mc) {
+        if (pos1 == null || pos2 == null) {
+            msg("Najpierw ustaw teren: /post1 i /post2", Formatting.RED);
+            return;
         }
-        if (!d.world1.equals(d.world2)) {
-            msg(player, "post1 i post2 sa w roznych wymiarach!", Formatting.RED);
-            return 0;
+        if (targets().isEmpty()) {
+            msg("Ustaw jakis blok: /kop <blok> (np. /kop hay_block)", Formatting.RED);
+            return;
         }
-        if (activeBlocks(d).isEmpty()) {
-            msg(player, "Ustaw jakis blok: /kop <blok> (np. /kop hay_block)", Formatting.RED);
-            return 0;
-        }
-        if (volume(d) > MAX_VOLUME) {
-            msg(player, "Teren jest za duzy (max " + MAX_VOLUME + " blokow).", Formatting.RED);
-            return 0;
-        }
-        d.active = true;
-        d.cursor = 0;
-        msg(player, "Kopanie WLACZONE. Wylaczysz przez /kop-stop", Formatting.GREEN);
-        return 1;
+        active = true;
+        current = null;
+        msg("Kopanie WLACZONE (N albo /kop-stop wylacza).", Formatting.GREEN);
     }
 
-    private int stop(CommandContext<ServerCommandSource> ctx) throws CommandSyntaxException {
-        ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
-        data(player).active = false;
-        msg(player, "Kopanie WYLACZONE.", Formatting.YELLOW);
-        return 1;
+    private static void stop(MinecraftClient mc) {
+        active = false;
+        current = null;
+        if (mc != null && mc.interactionManager != null) mc.interactionManager.cancelBlockBreaking();
+        msg("Kopanie WYLACZONE.", Formatting.YELLOW);
     }
 
-    private int list(CommandContext<ServerCommandSource> ctx) throws CommandSyntaxException {
-        ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
-        PlayerData d = data(player);
-        msg(player, "post1: " + fmt(d.pos1) + " | post2: " + fmt(d.pos2), Formatting.AQUA);
+    private static void list() {
+        msg("post1: " + fmt(pos1) + " | post2: " + fmt(pos2), Formatting.AQUA);
         for (int i = 0; i < MAX_SLOTS; i++) {
-            if (d.slots[i] != null) {
-                msg(player, "Slot " + (i + 1) + ": " + Registries.BLOCK.getId(d.slots[i]), Formatting.AQUA);
+            if (slots[i] != null) msg("Slot " + (i + 1) + ": " + Registries.BLOCK.getId(slots[i]), Formatting.AQUA);
+        }
+        msg("Kopanie: " + (active ? "wlaczone" : "wylaczone"), Formatting.AQUA);
+    }
+
+    // ------------------------------------------------------------ kopanie
+
+    private static void tick(MinecraftClient mc) {
+        ClientPlayerEntity p = mc.player;
+        ClientWorld w = mc.world;
+        ClientPlayerInteractionManager im = mc.interactionManager;
+        if (p == null || w == null || im == null) {
+            active = false;
+            current = null;
+            return;
+        }
+        if (mc.currentScreen != null) return; // pauza gdy otwarte menu/ekwipunek
+
+        Set<Block> targets = targets();
+        double reach = Math.max(1.0, im.getReachDistance() - 0.5);
+
+        BlockHitResult hit = null;
+        if (current != null) {
+            if (inRegion(current) && isTarget(w, current, targets)) {
+                hit = visibleHit(p, w, current, reach);
+            }
+            if (hit == null) current = null;
+        }
+
+        if (current == null) {
+            im.cancelBlockBreaking();
+            hit = pickNext(p, w, targets, reach);
+            if (hit == null) return; // nic w zasiegu - chodz po terenie
+            current = hit.getBlockPos();
+        }
+
+        if (im.updateBlockBreakingProgress(current, hit.getSide())) {
+            mc.particleManager.addBlockBreakingParticles(current, hit.getSide());
+            p.swingHand(Hand.MAIN_HAND);
+        }
+    }
+
+    private static BlockHitResult pickNext(ClientPlayerEntity p, ClientWorld w, Set<Block> targets, double reach) {
+        int minX = Math.min(pos1.getX(), pos2.getX()), maxX = Math.max(pos1.getX(), pos2.getX());
+        int minY = Math.min(pos1.getY(), pos2.getY()), maxY = Math.max(pos1.getY(), pos2.getY());
+        int minZ = Math.min(pos1.getZ(), pos2.getZ()), maxZ = Math.max(pos1.getZ(), pos2.getZ());
+
+        BlockPos pp = p.getBlockPos();
+        int r = (int) Math.ceil(reach) + 1;
+        int x0 = Math.max(minX, pp.getX() - r), x1 = Math.min(maxX, pp.getX() + r);
+        int y0 = Math.max(minY, pp.getY() - r), y1 = Math.min(maxY, pp.getY() + r);
+        int z0 = Math.max(minZ, pp.getZ() - r), z1 = Math.min(maxZ, pp.getZ() + r);
+
+        Vec3d eye = p.getEyePos();
+        List<BlockPos> candidates = new ArrayList<>();
+        for (int x = x0; x <= x1; x++) {
+            for (int y = y0; y <= y1; y++) {
+                for (int z = z0; z <= z1; z++) {
+                    BlockPos pos = new BlockPos(x, y, z);
+                    if (isTarget(w, pos, targets) && eye.distanceTo(Vec3d.ofCenter(pos)) <= reach) {
+                        candidates.add(pos);
+                    }
+                }
             }
         }
-        msg(player, "Kopanie: " + (d.active ? "wlaczone" : "wylaczone"), Formatting.AQUA);
-        return 1;
+        candidates.sort((a, b) -> Double.compare(
+                eye.squaredDistanceTo(Vec3d.ofCenter(a)), eye.squaredDistanceTo(Vec3d.ofCenter(b))));
+
+        for (BlockPos pos : candidates) {
+            BlockHitResult hit = visibleHit(p, w, pos, reach);
+            if (hit != null) return hit;
+        }
+        return null;
     }
 
-    private int clear(CommandContext<ServerCommandSource> ctx) throws CommandSyntaxException {
-        ServerPlayerEntity player = ctx.getSource().getPlayerOrThrow();
-        PlayerData d = data(player);
-        for (int i = 0; i < MAX_SLOTS; i++) d.slots[i] = null;
-        d.active = false;
-        msg(player, "Wyczyszczono wszystkie sloty blokow, kopanie wylaczone.", Formatting.YELLOW);
-        return 1;
+    /** Zwraca trafienie tylko jesli blok jest realnie widoczny (nie za innym blokiem) i w zasiegu. */
+    private static BlockHitResult visibleHit(ClientPlayerEntity p, ClientWorld w, BlockPos pos, double reach) {
+        Vec3d eye = p.getEyePos();
+        Vec3d center = Vec3d.ofCenter(pos);
+        if (eye.distanceTo(center) > reach) return null;
+        BlockHitResult r = w.raycast(new RaycastContext(eye, center,
+                RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, p));
+        if (r.getType() == HitResult.Type.BLOCK && r.getBlockPos().equals(pos)) return r;
+        return null;
     }
 
-    // ---------------------------------------------------------------- kopanie
+    private static boolean isTarget(ClientWorld w, BlockPos pos, Set<Block> targets) {
+        BlockState st = w.getBlockState(pos);
+        return !st.isAir() && targets.contains(st.getBlock()) && st.getHardness(w, pos) >= 0;
+    }
 
-    private static Set<Block> activeBlocks(PlayerData d) {
+    private static boolean inRegion(BlockPos p) {
+        return p.getX() >= Math.min(pos1.getX(), pos2.getX()) && p.getX() <= Math.max(pos1.getX(), pos2.getX())
+                && p.getY() >= Math.min(pos1.getY(), pos2.getY()) && p.getY() <= Math.max(pos1.getY(), pos2.getY())
+                && p.getZ() >= Math.min(pos1.getZ(), pos2.getZ()) && p.getZ() <= Math.max(pos1.getZ(), pos2.getZ());
+    }
+
+    private static Set<Block> targets() {
         Set<Block> set = new HashSet<>();
-        for (Block b : d.slots) if (b != null) set.add(b);
+        for (Block b : slots) if (b != null) set.add(b);
         return set;
     }
 
-    private static long volume(PlayerData d) {
-        long sx = Math.abs(d.pos1.getX() - d.pos2.getX()) + 1L;
-        long sy = Math.abs(d.pos1.getY() - d.pos2.getY()) + 1L;
-        long sz = Math.abs(d.pos1.getZ() - d.pos2.getZ()) + 1L;
-        return sx * sy * sz;
-    }
-
-    private void tickDigging(ServerPlayerEntity player, PlayerData d) {
-        if (d.pos1 == null || d.pos2 == null) return;
-        if (!(player.getWorld() instanceof ServerWorld world)) return;
-        if (!world.getRegistryKey().equals(d.world1)) return; // gracz w innym wymiarze - czekamy
-
-        Set<Block> targets = activeBlocks(d);
-        if (targets.isEmpty()) return;
-
-        int minX = Math.min(d.pos1.getX(), d.pos2.getX());
-        int minY = Math.min(d.pos1.getY(), d.pos2.getY());
-        int minZ = Math.min(d.pos1.getZ(), d.pos2.getZ());
-        long sx = Math.abs(d.pos1.getX() - d.pos2.getX()) + 1L;
-        long sy = Math.abs(d.pos1.getY() - d.pos2.getY()) + 1L;
-        long sz = Math.abs(d.pos1.getZ() - d.pos2.getZ()) + 1L;
-        long vol = sx * sy * sz;
-
-        int broken = 0;
-        BlockPos.Mutable p = new BlockPos.Mutable();
-
-        for (int scanned = 0; scanned < SCANS_PER_TICK && broken < BREAKS_PER_TICK; scanned++) {
-            long idx = d.cursor % vol;
-            d.cursor = (d.cursor + 1) % vol;
-
-            int x = minX + (int) (idx % sx);
-            int y = minY + (int) ((idx / sx) % sy);
-            int z = minZ + (int) (idx / (sx * sy));
-            p.set(x, y, z);
-
-            if (!world.getChunkManager().isChunkLoaded(x >> 4, z >> 4)) continue;
-
-            BlockState state = world.getBlockState(p);
-            if (state.isAir() || !targets.contains(state.getBlock())) continue;
-            if (state.getHardness(world, p) < 0) continue; // np. bedrock
-
-            BlockPos immutable = p.toImmutable();
-            BlockEntity be = world.getBlockEntity(immutable);
-            List<ItemStack> drops = Block.getDroppedStacks(state, world, immutable, be, player, player.getMainHandStack());
-            world.breakBlock(immutable, false, player);
-            for (ItemStack stack : drops) {
-                player.getInventory().offerOrDrop(stack); // do ekwipunku, a jak pelny - pod nogi
-            }
-            broken++;
-        }
-    }
-
-    // ---------------------------------------------------------------- pomocnicze
+    // ------------------------------------------------------------ pomocnicze
 
     private static String fmt(BlockPos p) {
         return p == null ? "brak" : p.getX() + ", " + p.getY() + ", " + p.getZ();
     }
 
-    private static void msg(ServerPlayerEntity player, String text, Formatting color) {
-        player.sendMessage(Text.literal("[Kopanie] " + text).formatted(color), false);
+    private static void msg(String text, Formatting color) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc != null && mc.inGameHud != null) {
+            mc.inGameHud.getChatHud().addMessage(Text.literal("[Kopanie] " + text).formatted(color));
+        }
     }
 }
