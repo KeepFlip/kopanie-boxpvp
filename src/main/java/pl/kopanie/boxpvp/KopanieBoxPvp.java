@@ -15,6 +15,8 @@ import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.command.CommandSource;
 import net.minecraft.command.argument.IdentifierArgumentType;
+import net.minecraft.enchantment.EnchantmentHelper;
+import net.minecraft.enchantment.Enchantments;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
 import net.minecraft.registry.Registries;
@@ -54,8 +56,8 @@ public class KopanieBoxPvp implements ClientModInitializer {
     // ====== USTAWIENIA ======
     private static final int EAT_AT_FOOD = 4;      // je gdy glod <= 4 (20 = pelny pasek)
     private static final int EAT_UNTIL_FOOD = 18;  // przestaje jesc gdy glod >= 18
-    private static final float MAX_TURN = 25f;     // max obrot kamery na tick (stopnie)
-    private static final float ALIGN_DEG = 4f;     // kopie gdy patrzy dokladnie na blok
+    private static final float MAX_TURN = 14f;     // max obrot kamery na tick (stopnie)
+    private static final float ALIGN_DEG = 6f;     // kopie gdy patrzy mniej wiecej na blok
     private static final int WALK_RANGE_H = 32;    // jak daleko szuka generatorow (poziomo)
     private static final int WALK_RANGE_V = 8;     // jak daleko szuka generatorow (pionowo)
     private static final int STUCK_TICKS = 100;    // po ilu tickach bez ruchu uznaje ze utknal
@@ -77,6 +79,8 @@ public class KopanieBoxPvp implements ClientModInitializer {
     private static int prevSlot = -1;
     private static boolean warnedNoFood = false;
     private static boolean warnedEmpty = false;
+    private static int cooldown = 0;
+    private static final java.util.Random RNG = new java.util.Random();
 
     @Override
     public void onInitializeClient() {
@@ -160,6 +164,7 @@ public class KopanieBoxPvp implements ClientModInitializer {
         eating = false;
         warnedNoFood = false;
         warnedEmpty = false;
+        cooldown = 0;
         msg("Kopanie WLACZONE (N albo /kop-stop wylacza).", Formatting.GREEN);
     }
 
@@ -211,18 +216,31 @@ public class KopanieBoxPvp implements ClientModInitializer {
             if (inRegion(current) && isTarget(w, current, targets)) {
                 hit = visibleHit(p, w, current, reach);
             }
-            if (hit == null) current = null;
+            if (hit == null) {
+                current = null;
+                cooldown = 3 + RNG.nextInt(5); // krotka pauza po zniszczeniu bloku
+            }
         }
         if (current == null) {
             im.cancelBlockBreaking();
+            if (cooldown > 0) {
+                cooldown--;
+                mc.options.forwardKey.setPressed(false);
+                mc.options.sprintKey.setPressed(false);
+                return;
+            }
             hit = pickNext(p, w, targets, reach);
-            if (hit != null) current = hit.getBlockPos();
+            if (hit != null) {
+                current = hit.getBlockPos();
+                selectBestTool(p, w.getBlockState(current));
+            }
         }
 
         if (hit != null) {
             // blok w zasiegu: stoimy, patrzymy na niego i kopiemy
             mc.options.forwardKey.setPressed(false);
             mc.options.jumpKey.setPressed(false);
+            mc.options.sprintKey.setPressed(false);
             stuckTicks = 0;
             warnedEmpty = false;
             float[] err = lookAt(p, hit.getPos());
@@ -255,7 +273,9 @@ public class KopanieBoxPvp implements ClientModInitializer {
         warnedEmpty = false;
 
         float[] err = lookAt(p, Vec3d.ofCenter(walkGoal));
-        mc.options.forwardKey.setPressed(err[0] < 25f);
+        boolean go = err[0] < 25f;
+        mc.options.forwardKey.setPressed(go);
+        mc.options.sprintKey.setPressed(go && p.getHungerManager().getFoodLevel() > 6);
         mc.options.jumpKey.setPressed(p.horizontalCollision && p.isOnGround());
 
         Vec3d now = p.getPos();
@@ -341,6 +361,45 @@ public class KopanieBoxPvp implements ClientModInitializer {
         return false;
     }
 
+    private static float easeStep(float diff) {
+        float step = diff * 0.3f;
+        float min = 0.4f;
+        if (Math.abs(diff) <= min) return diff;
+        if (Math.abs(step) < min) step = Math.signum(diff) * min;
+        return MathHelper.clamp(step, -MAX_TURN, MAX_TURN);
+    }
+
+    // ------------------------------------------------------------ zmiana narzedzi
+
+    /** Wybiera z hotbara najlepsze narzedzie do danego bloku (pomija wolowine i prawie zepsute). */
+    private static void selectBestTool(ClientPlayerEntity p, BlockState state) {
+        int cur = p.getInventory().selectedSlot;
+        int best = cur;
+        float bestScore = toolScore(p.getInventory().getStack(cur), state);
+        for (int i = 0; i < 9; i++) {
+            if (i == cur) continue;
+            ItemStack st = p.getInventory().getStack(i);
+            if (st.isEmpty() || isBeef(st)) continue;
+            float sc = toolScore(st, state);
+            if (sc > bestScore + 0.01f) {
+                bestScore = sc;
+                best = i;
+            }
+        }
+        if (best != cur) p.getInventory().selectedSlot = best;
+    }
+
+    private static float toolScore(ItemStack st, BlockState state) {
+        if (st.isEmpty()) return 1f;
+        if (st.isDamageable() && st.getMaxDamage() - st.getDamage() <= 1) return 0f; // nie psuj narzedzia do konca
+        float speed = st.getMiningSpeedMultiplier(state);
+        if (speed > 1f) {
+            int eff = EnchantmentHelper.getLevel(Enchantments.EFFICIENCY, st);
+            if (eff > 0) speed += eff * eff + 1;
+        }
+        return speed;
+    }
+
     private static boolean isBeef(ItemStack st) {
         return st.isOf(Items.COOKED_BEEF) || st.isOf(Items.BEEF);
     }
@@ -406,8 +465,11 @@ public class KopanieBoxPvp implements ClientModInitializer {
 
         float dYaw = MathHelper.wrapDegrees(wantYaw - p.getYaw());
         float dPitch = wantPitch - p.getPitch();
-        p.setYaw(p.getYaw() + MathHelper.clamp(dYaw, -MAX_TURN, MAX_TURN));
-        p.setPitch(MathHelper.clamp(p.getPitch() + MathHelper.clamp(dPitch, -MAX_TURN, MAX_TURN), -90f, 90f));
+        // obrot z wyhamowaniem: szybko na poczatku, wolno przy celu (jak ruch myszka)
+        float stepYaw = easeStep(dYaw);
+        float stepPitch = easeStep(dPitch);
+        p.setYaw(p.getYaw() + stepYaw);
+        p.setPitch(MathHelper.clamp(p.getPitch() + stepPitch, -90f, 90f));
 
         return new float[]{
                 Math.abs(MathHelper.wrapDegrees(wantYaw - p.getYaw())),
@@ -438,6 +500,7 @@ public class KopanieBoxPvp implements ClientModInitializer {
         mc.options.forwardKey.setPressed(false);
         mc.options.jumpKey.setPressed(false);
         mc.options.useKey.setPressed(false);
+        mc.options.sprintKey.setPressed(false);
     }
 
     private static String fmt(BlockPos p) {
